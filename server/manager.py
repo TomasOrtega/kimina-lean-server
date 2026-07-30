@@ -19,23 +19,31 @@ class Manager:
         self,
         *,
         max_repls: int = settings.max_repls,
+        max_repl_starts: int = settings.max_repl_starts,
         max_repl_uses: int = settings.max_repl_uses,
         max_repl_mem: int = settings.max_repl_mem,
         init_repls: dict[str, int] = settings.init_repls,
     ) -> None:
+        if max_repl_starts < 1:
+            raise ValueError("max_repl_starts must be at least 1")
         self.max_repls = max_repls
+        self.max_repl_starts = max_repl_starts
         self.max_repl_uses = max_repl_uses
         self.max_repl_mem = max_repl_mem
         self.init_repls = init_repls
 
         self._lock: asyncio.Lock | None = None
         self._cond: asyncio.Condition | None = None
+        self._start_semaphore: asyncio.Semaphore | None = None
         self._free: list[Repl] = []
         self._busy: set[Repl] = set()
+        self._starting = 0
+        self._starting_by_header: dict[str, int] = {}
 
         logger.info(
-            "REPL manager initialized with: MAX_REPLS={}, MAX_REPL_USES={}, MAX_REPL_MEM={} MB",
+            "REPL manager initialized with: MAX_REPLS={}, MAX_REPL_STARTS={}, MAX_REPL_USES={}, MAX_REPL_MEM={} MB",
             max_repls,
+            max_repl_starts,
             max_repl_uses,
             max_repl_mem,
         )
@@ -45,6 +53,7 @@ class Manager:
         if self._lock is None:
             self._lock = asyncio.Lock()
             self._cond = asyncio.Condition(self._lock)
+            self._start_semaphore = asyncio.Semaphore(self.max_repl_starts)
 
     async def initialize_repls(self) -> None:
         if len(self.init_repls) == 0:
@@ -53,17 +62,19 @@ class Manager:
             raise ValueError(
                 f"Cannot initialize REPLs: Σ (INIT_REPLS values) = {sum(self.init_repls.values())} > {self.max_repls} = MAX_REPLS"
             )
-        initialized_repls: list[Repl] = []
-        for header, count in self.init_repls.items():
-            for _ in range(count):
-                initialized_repls.append(await self.get_repl(header=header))
-
-        async def _prep_and_release(repl: Repl) -> None:
+        async def _initialize(header: str) -> None:
+            repl = await self.get_repl(header=header)
             # All initialized imports should finish in 60 seconds.
             await self.prep(repl, snippet_id="init", timeout=60, debug=False)
             await self.release_repl(repl)
 
-        await asyncio.gather(*(_prep_and_release(r) for r in initialized_repls))
+        await asyncio.gather(
+            *(
+                _initialize(header)
+                for header, count in self.init_repls.items()
+                for _ in range(count)
+            )
+        )
 
         logger.info(f"Initialized REPLs with: {json.dumps(self.init_repls, indent=2)}")
 
@@ -99,16 +110,33 @@ class Manager:
                                 f"\\[{repl.uuid.hex[:8]}] Reusing ({'started' if repl.is_running else 'non-started'}) REPL for {snippet_id}"
                             )
                             return repl
-                total = len(self._free) + len(self._busy)
-                if total < self.max_repls:
+                total = len(self._free) + len(self._busy) + self._starting
+                header_total = (
+                    sum(repl.header == header for repl in self._free)
+                    + sum(repl.header == header for repl in self._busy)
+                    + self._starting_by_header.get(header, 0)
+                )
+                header_limit = max(
+                    self.max_repl_starts, self.init_repls.get(header, 0)
+                )
+                can_create = not reuse or header_total < header_limit
+                if total < self.max_repls and can_create:
+                    self._starting += 1
+                    self._starting_by_header[header] = (
+                        self._starting_by_header.get(header, 0) + 1
+                    )
                     break
 
-                if self._free:
+                if self._free and can_create:
                     oldest = min(
                         self._free, key=lambda r: r.last_check_at
                     )  # Use the one that's been around the longest
                     self._free.remove(oldest)
                     repl_to_destroy = oldest
+                    self._starting += 1
+                    self._starting_by_header[header] = (
+                        self._starting_by_header.get(header, 0) + 1
+                    )
                     break
 
                 remaining = deadline - time()
@@ -129,7 +157,27 @@ class Manager:
         if repl_to_destroy is not None:
             asyncio.create_task(close_verbose(repl_to_destroy))
 
-        return await self.start_new(header)
+        try:
+            repl = await self.start_new(header)
+        except BaseException:
+            async with self._cond:
+                self._starting -= 1
+                self._finish_start(header)
+                self._cond.notify(1)
+            raise
+
+        async with self._cond:
+            self._starting -= 1
+            self._finish_start(header)
+            self._busy.add(repl)
+            return repl
+
+    def _finish_start(self, header: str) -> None:
+        remaining = self._starting_by_header[header] - 1
+        if remaining:
+            self._starting_by_header[header] = remaining
+        else:
+            del self._starting_by_header[header]
 
     async def destroy_repl(self, repl: Repl) -> None:
         self._ensure_lock()
@@ -166,11 +214,9 @@ class Manager:
             self._cond.notify(1)
 
     async def start_new(self, header: str) -> Repl:
-        repl = await Repl.create(
+        return await Repl.create(
             header, max_repl_uses=self.max_repl_uses, max_repl_mem=self.max_repl_mem
         )
-        self._busy.add(repl)
-        return repl
 
     async def cleanup(self) -> None:
         self._ensure_lock()
@@ -193,7 +239,16 @@ class Manager:
     ) -> ReplResponse | None:
         if repl.is_running:
             return None
+        self._ensure_lock()
+        assert self._start_semaphore is not None
+        async with self._start_semaphore:
+            if repl.is_running:
+                return None
+            return await self._prep(repl, snippet_id, timeout, debug)
 
+    async def _prep(
+        self, repl: Repl, snippet_id: str, timeout: float, debug: bool
+    ) -> ReplResponse | None:
         try:
             await repl.start()
         except Exception as e:

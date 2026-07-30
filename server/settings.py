@@ -25,11 +25,12 @@ class Settings(BaseSettings):
 
     environment: Environment = Environment.dev
 
-    lean_version: str = "v4.26.0"
+    lean_version: str = "v4.28.0"
     repl_path: Path = BASE_DIR / "repl/.lake/build/bin/repl"
     project_dir: Path = BASE_DIR / "mathlib4"
 
     max_repls: int = max((os.cpu_count() or 1) - 1, 1)
+    max_repl_starts: int = 2
     max_repl_uses: int = -1
     max_repl_mem: int = 12
     max_wait: int = 60
