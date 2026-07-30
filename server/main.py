@@ -43,6 +43,7 @@ def create_app(settings: Settings) -> FastAPI:
 
         manager = Manager(
             max_repls=settings.max_repls,
+            max_repl_starts=settings.max_repl_starts,
             max_repl_uses=settings.max_repl_uses,
             max_repl_mem=settings.max_repl_mem,
             init_repls=settings.init_repls,
